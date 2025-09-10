@@ -84,4 +84,79 @@ add_filter( 'wp_insert_post_data', function( $data, $postarr ) {
 
 		add_filter( 'redirect_post_location', function( $location ) use ( $missing ) {
 			return add_query_arg(
-				array( 'sm
+				array( 'sm_require_feat_excerpt' => implode( ',', $missing ) ),
+				$location
+			);
+		}, 999 );
+	}
+
+	return $data;
+
+}, 10, 2 );
+
+// ---- admin notice ----------------------------------------------------------
+
+add_action( 'admin_notices', function() {
+	if ( empty( $_GET['sm_require_feat_excerpt'] ) ) return;
+
+	$missing = explode( ',', sanitize_text_field( wp_unslash( $_GET['sm_require_feat_excerpt'] ) ) );
+	$msg = sm_requirements_message( $missing );
+
+	echo '<div class="notice notice-error is-dismissible"><p>' . esc_html( $msg ) . '</p></div>';
+});
+
+// ---- REST (Gutenberg/editor & API) -----------------------------------------
+
+// Accept 2 or 3 args safely (older WP may pass only 2).
+function sm_rest_guard_requirements( $prepared_post, $request, $creating = null ) {
+	$post_type = isset( $prepared_post->post_type ) ? $prepared_post->post_type : 'post';
+	if ( ! sm_enforce_requirements_for_type( $post_type ) ) {
+		return $prepared_post;
+	}
+
+	$status = isset( $prepared_post->post_status ) ? $prepared_post->post_status : '';
+	if ( ! in_array( $status, array( 'publish', 'future' ), true ) ) {
+		return $prepared_post;
+	}
+
+	$data = array(
+		'post_status'  => $status,
+		'post_type'    => $post_type,
+		'post_excerpt' => isset( $prepared_post->post_excerpt ) ? (string) $prepared_post->post_excerpt : '',
+	);
+
+	$postarr = array(
+		'ID' => isset( $prepared_post->ID ) ? (int) $prepared_post->ID : 0,
+		'meta_input' => array(
+			// WP REST uses featured_media; fall back to meta if present
+			'_thumbnail_id' => (int) (
+				$request instanceof WP_REST_Request
+					? ( $request->get_param( 'featured_media' ) ?: $request->get_param( 'meta' )['_thumbnail_id'] ?? 0 )
+					: 0
+			),
+		),
+	);
+
+	$missing = sm_missing_requirements( $data, $postarr );
+	if ( ! empty( $missing ) ) {
+		return new WP_Error(
+			'sm_require_feat_excerpt',
+			sm_requirements_message( $missing ),
+			array( 'status' => 400 )
+		);
+	}
+
+	return $prepared_post;
+}
+
+// Explicitly register for core types with accepted_args=3 (safe even if WP passes 2)
+add_filter( 'rest_pre_insert_post', 'sm_rest_guard_requirements', 10, 3 );
+add_filter( 'rest_pre_insert_page', 'sm_rest_guard_requirements', 10, 3 );
+
+// Dynamically register for all other public CPTs
+add_action( 'init', function() {
+	foreach ( get_post_types( array( 'public' => true ) ) as $type ) {
+		if ( in_array( $type, array( 'post','page','attachment' ), true ) ) continue;
+		add_filter( "rest_pre_insert_{$type}", 'sm_rest_guard_requirements', 10, 3 );
+	}
+});
