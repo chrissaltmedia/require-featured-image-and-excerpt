@@ -2,7 +2,7 @@
 /**
  * Plugin Name: Require Featured Image & Excerpt + Unspinner (Merged)
  * Description: Blocks publish/schedule unless BOTH a featured image and an excerpt exist (shows proper WP error messages) and removes stuck LoadingOverlay spinners on post editor screens (e.g., from Permalink Manager Pro).
- * Version: 2.0.0
+ * Version: 2.0.1
  */
 
 if ( ! defined('ABSPATH') ) exit;
@@ -21,13 +21,18 @@ function sm_is_public_type( $type ) : bool {
 function sm_is_publish_like( $status ) : bool {
 	return in_array( (string) $status, ['publish','future'], true );
 }
-function sm_missing_from_ids( int $post_id, string $excerpt_in = '' ) : array {
-	$missing = [];
-	$ex = trim( $excerpt_in !== '' ? $excerpt_in : (string) get_post_field( 'post_excerpt', $post_id ) );
-	if ( $ex === '' ) $missing[] = 'excerpt';
-	if ( ! get_post_thumbnail_id( $post_id ) ) $missing[] = 'thumbnail';
-	return $missing;
+function sm_msg( array $missing ) : string {
+	if ( in_array( 'thumbnail', $missing, true ) && in_array( 'excerpt', $missing, true ) ) {
+		return 'Publishing blocked: please add a featured image and an excerpt.';
+	}
+	if ( in_array( 'thumbnail', $missing, true ) ) return 'Publishing blocked: please add a featured image.';
+	if ( in_array( 'excerpt',   $missing, true ) ) return 'Publishing blocked: please add an excerpt.';
+	return 'Publishing blocked: required fields are missing.';
 }
+
+/**
+ * Classic/Quick Edit payload checker (no REST request object here).
+ */
 function sm_missing_from_payload( array $data, array $postarr ) : array {
 	$missing = [];
 
@@ -43,20 +48,13 @@ function sm_missing_from_payload( array $data, array $postarr ) : array {
 	$id = isset( $postarr['ID'] ) ? (int) $postarr['ID'] : 0;
 	if ( $id && get_post_thumbnail_id( $id ) ) $has_thumb = true;
 	if ( ! $has_thumb ) {
+		// Respect incoming thumbnail via meta/POST (classic flows)
 		if ( ! empty( $postarr['meta_input']['_thumbnail_id'] ) && (int) $postarr['meta_input']['_thumbnail_id'] > 0 ) $has_thumb = true;
 		elseif ( ! empty( $_POST['_thumbnail_id'] ) && (int) $_POST['_thumbnail_id'] > 0 ) $has_thumb = true;
 	}
 	if ( ! $has_thumb ) $missing[] = 'thumbnail';
 
 	return $missing;
-}
-function sm_msg( array $missing ) : string {
-	if ( in_array( 'thumbnail', $missing, true ) && in_array( 'excerpt', $missing, true ) ) {
-		return 'Publishing blocked: please add a featured image and an excerpt.';
-	}
-	if ( in_array( 'thumbnail', $missing, true ) ) return 'Publishing blocked: please add a featured image.';
-	if ( in_array( 'excerpt',   $missing, true ) ) return 'Publishing blocked: please add an excerpt.';
-	return 'Publishing blocked: required fields are missing.';
 }
 
 /* ---------------- Classic / Quick Edit path (no JS) ----------------
@@ -96,6 +94,7 @@ add_action( 'admin_notices', function() {
 /* ---------------- Gutenberg / REST path (shows red error) ----------------
    - Return WP_Error (HTTP 412) on publish/schedule only.
    - Draft saves/autosaves are unaffected.
+   - FIX: Honor `featured_media` in the SAME request even for updates.
 -------------------------------------------------------------------------- */
 
 function sm_rest_guard( $prepared_post, $request, $creating = null ) {
@@ -108,16 +107,20 @@ function sm_rest_guard( $prepared_post, $request, $creating = null ) {
 	$post_id    = (int) ( $prepared_post->ID ?? 0 );
 	$excerpt_in = isset( $prepared_post->post_excerpt ) ? (string) $prepared_post->post_excerpt : '';
 
-	$thumb_in_id = 0;
+	// Read thumbnail intent from payload (Gutenberg sends featured_media when changed)
+	$thumb_payload = 0;
 	if ( $request instanceof WP_REST_Request ) {
 		$meta = (array) $request->get_param( 'meta' );
-		$thumb_in_id = (int) ( $request->get_param( 'featured_media' ) ?: ( $meta['_thumbnail_id'] ?? 0 ) );
+		$thumb_payload = (int) ( $request->get_param( 'featured_media' ) ?: ( $meta['_thumbnail_id'] ?? 0 ) );
 	}
 
-	// If creating and a featured_media id is sent, treat thumbnail as present.
-	$missing = ( $post_id === 0 && $thumb_in_id > 0 )
-		? ( trim( $excerpt_in ) === '' ? [ 'excerpt' ] : [] )
-		: sm_missing_from_ids( $post_id, $excerpt_in );
+	// Compute presence: payload OR existing DB
+	$has_thumb = ( $thumb_payload > 0 ) || ( $post_id > 0 && (bool) get_post_thumbnail_id( $post_id ) );
+	$needs_excerpt = ( trim( $excerpt_in ) === '' );
+
+	$missing = [];
+	if ( ! $has_thumb )    $missing[] = 'thumbnail';
+	if ( $needs_excerpt )  $missing[] = 'excerpt';
 
 	if ( ! empty( $missing ) ) {
 		return new WP_Error( 'sm_require_feat_excerpt', sm_msg( $missing ), [ 'status' => 412 ] );
@@ -143,12 +146,12 @@ add_action( 'admin_enqueue_scripts', function( $hook ) {
 	if ( $hook !== 'post.php' && $hook !== 'post-new.php' ) return;
 
 	// Safety CSS: hide any overlay immediately.
-	wp_register_style( 'sm-unspinner', false, [], '2.0.0' );
+	wp_register_style( 'sm-unspinner', false, [], '2.0.1' );
 	wp_enqueue_style( 'sm-unspinner' );
 	wp_add_inline_style( 'sm-unspinner', '.loadingoverlay{display:none!important;opacity:0!important;pointer-events:none!important;}' );
 
 	// JS cleaner (uses jQuery if present; guards if not).
-	wp_register_script( 'sm-unspinner', false, [ 'jquery' ], '2.0.0', true );
+	wp_register_script( 'sm-unspinner', false, [ 'jquery' ], '2.0.1', true );
 	wp_enqueue_script( 'sm-unspinner' );
 
 	wp_add_inline_script( 'sm-unspinner', <<<JS
@@ -160,7 +163,6 @@ add_action( 'admin_enqueue_scripts', function( $hook ) {
 			['html','body'].forEach(function(sel){
 				var el = d.querySelector(sel);
 				if (!el) return;
-				// Only reset if obviously locked
 				if (el.style && (el.style.overflow === 'hidden' || el.style.overflowY === 'hidden')) {
 					el.style.overflow = '';
 					el.style.overflowY = '';
@@ -178,7 +180,6 @@ add_action( 'admin_enqueue_scripts', function( $hook ) {
 				if (n && n.parentNode) { n.parentNode.removeChild(n); removed = true; }
 			}
 		} catch(e){}
-		// Try library API if present
 		try {
 			if ($ && $.LoadingOverlay) { $.LoadingOverlay('hide', true); }
 			if ($ && $('body').LoadingOverlay) { $('body').LoadingOverlay('hide', true); }
@@ -187,7 +188,6 @@ add_action( 'admin_enqueue_scripts', function( $hook ) {
 		return removed;
 	}
 
-	// Clean on ajax/fetch completion (handles REST 4xx/5xx).
 	if ($ && $.ajaxSetup) {
 		$(d).on('ajaxComplete ajaxError', function(){ killOverlays(); });
 	}
@@ -202,7 +202,6 @@ add_action( 'admin_enqueue_scripts', function( $hook ) {
 		w.fetch.__sm_unspinner__ = true;
 	}
 
-	// Mutation observer: nuke overlays if (re)added
 	try {
 		var mo = new MutationObserver(function(muts){
 			for (var i=0;i<muts.length;i++){
@@ -222,11 +221,9 @@ add_action( 'admin_enqueue_scripts', function( $hook ) {
 		mo.observe(d.body || d.documentElement, { childList:true, subtree:true });
 	} catch(e){}
 
-	// Belt & braces
 	var iv = setInterval(killOverlays, 1000);
 	w.addEventListener('beforeunload', function(){ clearInterval(iv); }, { passive:true });
 
-	// First pass
 	killOverlays();
 
 })(window, document, window.jQuery || null);
